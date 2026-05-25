@@ -57,6 +57,4 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 
-
-.vscode/*
-!.vscode/extensions.json
+.vscode/

@@ -3,8 +3,6 @@
 
 Zenwii Windows es un editor de notas ultra-rápido, minimalista y de diseño premium, diseñado específicamente para funcionar sin distracciones. Combina la velocidad instantánea de arranque de un bloc de notas local con el poder de sincronización en tiempo real en la nube de Firebase, envuelto en una interfaz glassmorphic impresionante.
 
-![Zenwii Logo](/src-tauri/icons/icon.png)
-
 ---
 
 ## 🚀 ¿Por qué Zenwii? (Propuesta de Valor)
