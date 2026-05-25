@@ -1,0 +1,58 @@
+# ==========================================
+# Zenwii Windows - .gitignore Pro
+# ==========================================
+
+# --- Dependencias y Paquetes ---
+node_modules/
+.pnpm-store/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# --- Compilados y Entregables ---
+dist/
+dist-ssr/
+/src-tauri/target/
+/src-tauri/gen/
+
+# --- Configuración y Claves Secretas (Crítico) ---
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+*.pem
+*.key
+google-services.json
+firebase-keys.json
+client-secret*.json
+
+# --- Logs del Sistema y Debugging ---
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# --- Archivos de Editores e IDEs ---
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.patch
+*.diff
+
+# --- Temporales de Sistema Operativo ---
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
