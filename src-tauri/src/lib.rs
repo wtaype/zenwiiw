@@ -1,6 +1,108 @@
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::io::{Read, Write};
 use std::time::Duration;
+use rusqlite::{params, Connection};
+use tauri::Manager;
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct LocalNote {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    #[serde(rename = "contentMd")]
+    pub content_md: String,
+    pub pinned: bool,
+    pub created: i64,
+    pub updated: i64,
+    pub synced: bool,
+    pub remote: bool,
+}
+
+fn get_connection(app_handle: &tauri::AppHandle) -> Result<Connection, String> {
+    let data_dir = app_handle.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+    let db_path = data_dir.join("zenwii.db");
+    Connection::open(db_path).map_err(|e| e.to_string())
+}
+
+fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
+    let conn = get_connection(app_handle)?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS notas (
+            id TEXT PRIMARY KEY,
+            title TEXT,
+            content TEXT,
+            content_md TEXT,
+            pinned INTEGER,
+            created INTEGER,
+            updated INTEGER,
+            synced INTEGER,
+            remote INTEGER
+        )",
+        [],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn db_load_notes(app_handle: tauri::AppHandle) -> Result<Vec<LocalNote>, String> {
+    let conn = get_connection(&app_handle)?;
+    let mut stmt = conn
+        .prepare("SELECT id, title, content, content_md, pinned, created, updated, synced, remote FROM notas")
+        .map_err(|e| e.to_string())?;
+    
+    let note_iter = stmt
+        .query_map([], |row| {
+            Ok(LocalNote {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                content: row.get(2)?,
+                content_md: row.get(3)?,
+                pinned: row.get::<_, i32>(4)? != 0,
+                created: row.get(5)?,
+                updated: row.get(6)?,
+                synced: row.get::<_, i32>(7)? != 0,
+                remote: row.get::<_, i32>(8)? != 0,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+        
+    let mut notes = Vec::new();
+    for note in note_iter {
+        notes.push(note.map_err(|e| e.to_string())?);
+    }
+    
+    Ok(notes)
+}
+
+#[tauri::command]
+async fn db_save_note(app_handle: tauri::AppHandle, note: LocalNote) -> Result<(), String> {
+    let conn = get_connection(&app_handle)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO notas (id, title, content, content_md, pinned, created, updated, synced, remote)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            note.id,
+            note.title,
+            note.content,
+            note.content_md,
+            if note.pinned { 1 } else { 0 },
+            note.created,
+            note.updated,
+            if note.synced { 1 } else { 0 },
+            if note.remote { 1 } else { 0 },
+        ],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn db_delete_note(app_handle: tauri::AppHandle, id: String) -> Result<(), String> {
+    let conn = get_connection(&app_handle)?;
+    conn.execute("DELETE FROM notas WHERE id = ?1", params![id])
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
 
 #[tauri::command]
 async fn start_auth_server() -> Result<serde_json::Value, String> {
@@ -103,9 +205,16 @@ async fn start_auth_server() -> Result<serde_json::Value, String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![start_auth_server])
+        .invoke_handler(tauri::generate_handler![
+            start_auth_server,
+            db_load_notes,
+            db_save_note,
+            db_delete_note
+        ])
         .setup(|app| {
-            use tauri::Manager;
+            if let Err(e) = init_db(app.handle()) {
+                eprintln!("Error al inicializar SQLite: {}", e);
+            }
             if let Some(window) = app.get_webview_window("main") {
                 if let Ok(Some(monitor)) = window.primary_monitor() {
                     let size = monitor.size();

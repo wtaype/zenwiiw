@@ -58,3 +58,8 @@ ehthumbs.db
 Desktop.ini
 
 .vscode/
+
+# --- Bases de Datos Locales (Sensible) ---
+*.db
+*.sqlite
+*.sqlite3

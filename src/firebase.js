@@ -30,6 +30,7 @@ import {
   setDoc,
   where,
   getFirestore,
+  onSnapshot,
 } from "firebase/firestore";
 import { firebaseConfig, noteCollection } from "./wii.js";
 
@@ -351,6 +352,7 @@ export async function loadRemoteNotes(user) {
       id: item.id,
       title: data.titulo || "Documento sin titulo",
       content: data.contenido || "",
+      contentMd: data.contenidoMd || "",
       pinned: !!data.pin,
       created,
       updated,
@@ -360,22 +362,75 @@ export async function loadRemoteNotes(user) {
   });
 }
 
+// Alias: carga única sin suscripción en tiempo real (útil cuando real-time sync está desactivado)
+export const loadRemoteNotesOnce = loadRemoteNotes;
+
+
 export async function saveRemoteNote(user, note) {
   requireFirebase();
   if (!user?.email || !note?.id) return;
+
+  let username = user.usuario || user.displayName || user.email || "nota";
+  if (username.includes("@")) {
+    username = username.split("@")[0];
+  }
+  const cleanUsername = username.toLowerCase().replace(/[^a-z0-9_-]/g, "");
+  const docId = `${cleanUsername}_${note.created}`;
+
+  const oldId = note.id;
+  if (oldId !== docId) {
+    try {
+      await deleteDoc(doc(db, noteCollection, oldId));
+    } catch (e) {
+      console.warn("[delete-old-remote-failed]", e);
+    }
+  }
+
   await setDoc(
-    doc(db, noteCollection, note.id),
+    doc(db, noteCollection, docId),
     {
-      id: note.id,
-      usuario: user.displayName || user.email,
+      id: docId,
+      usuario: cleanUsername,
       email: user.email,
       titulo: note.title || "Documento sin titulo",
       contenido: note.content || "",
+      contenidoMd: note.contentMd || "",
       pin: !!note.pinned,
       creado: note.remote ? note.created : serverTimestamp(),
       actualizado: serverTimestamp(),
     },
     { merge: true },
+  );
+  return docId;
+}
+
+export function subscribeRemoteNotes(user, onUpdate) {
+  if (!db) return () => {};
+  if (!user?.email) return () => {};
+  return onSnapshot(
+    query(collection(db, noteCollection), where("email", "==", user.email)),
+    (snap) => {
+      const notes = snap.docs.map((item) => {
+        const data = item.data();
+        const created = data.creado?.toMillis?.() || data.creado || Date.now();
+        const updated = data.actualizado?.toMillis?.() || data.actualizado || created;
+        return {
+          id: item.id,
+          title: data.titulo || "Documento sin titulo",
+          content: data.contenido || "",
+          contentMd: data.contenidoMd || "",
+          pinned: !!data.pin,
+          created,
+          updated,
+          synced: true,
+          remote: true,
+        };
+      });
+      onUpdate(notes);
+    },
+    (error) => {
+      console.warn("[onSnapshot-error]", error);
+    }
   );
 }
 

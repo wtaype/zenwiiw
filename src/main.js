@@ -13,6 +13,7 @@ import {
 } from "./widev.js";
 import { app, defaultTheme, version } from "./wii.js";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { htmlToMarkdown, markdownToHtml } from "./notas/convertirMd.js";
 
 const LS_NOTES = "notas_ls";
 const LS_OPEN_TABS = "zenwii_windows_open_tabs";
@@ -22,6 +23,7 @@ const demoNote = () => ({
   id: uid(),
   title: "Mi primera nota",
   content: "<p>Bienvenido a Zenwii Windows. Escribe aqui: se guarda local al instante y sincroniza en segundo plano cuando inicias sesion.</p>",
+  contentMd: "Bienvenido a Zenwii Windows. Escribe aqui: se guarda local al instante y sincroniza en segundo plano cuando inicias sesion.",
   pinned: true,
   created: Date.now(),
   updated: Date.now(),
@@ -30,9 +32,9 @@ const demoNote = () => ({
 });
 
 const state = {
-  notes: storage.get(LS_NOTES, []),
-  openTabs: storage.get(LS_OPEN_TABS, []),
-  activeId: storage.get(LS_ACTIVE, null),
+  notes: [],
+  openTabs: [],
+  activeId: null,
   user: storage.get("zenwii_cached_user", null), // Carga instantánea de sesión desde caché local
   syncState: navigator.onLine ? "local" : "offline",
   query: "",
@@ -41,6 +43,8 @@ const state = {
 let cloudApi = null;
 let cloudBoot = null;
 let cloudListening = false;
+let unsubscribeNotes = null;
+let realtimeSyncEnabled = storage.get("zenwii_realtime_sync", true); // Default: ON
 
 const iconClasses = {
   menu: "fa-solid fa-bars",
@@ -73,23 +77,67 @@ const iconClasses = {
   font: "fa-solid fa-font",
   highlighter: "fa-solid fa-highlighter",
   feather: "fa-solid fa-feather-pointed",
+  link: "fa-solid fa-link",
+  info: "fa-solid fa-circle-info",
 };
 
 function icon(name) {
   return `<i class="ico ${iconClasses[name] || ""}" aria-hidden="true"></i>`;
 }
 
-if (!state.notes.length) {
-  const note = demoNote();
-  state.notes = [note];
-  state.openTabs = [note.id];
-  state.activeId = note.id;
+async function dbLoadAll() {
+  const isTauri = window.__TAURI__ || window.__TAURI_INTERNALS__ || window.origin?.includes("tauri") || location.protocol === "tauri:";
+  if (isTauri) {
+    try {
+      const dbNotes = await window.__TAURI__.core.invoke("db_load_notes");
+      if (dbNotes && dbNotes.length > 0) {
+        state.notes = dbNotes;
+      } else {
+        const note = demoNote();
+        state.notes = [note];
+        await window.__TAURI__.core.invoke("db_save_note", { note });
+      }
+    } catch (err) {
+      console.error("[SQLite load error, falling back to LocalStorage]", err);
+      state.notes = storage.get(LS_NOTES, []);
+    }
+  } else {
+    state.notes = storage.get(LS_NOTES, []);
+  }
+
+  state.openTabs = storage.get(LS_OPEN_TABS, []);
+  state.activeId = storage.get(LS_ACTIVE, null);
+  
+  if (!state.notes.length) {
+    const note = demoNote();
+    state.notes = [note];
+  }
+  state.openTabs = state.openTabs.filter((id) => state.notes.some((note) => note.id === id));
+  if (!state.openTabs.length) {
+    state.openTabs = [state.notes[0].id];
+  }
+  if (!state.activeId || !state.notes.some((n) => n.id === state.activeId)) {
+    state.activeId = state.notes[0].id;
+  }
 }
 
-function persist() {
-  storage.set(LS_NOTES, state.notes);
+async function persist() {
   storage.set(LS_OPEN_TABS, state.openTabs);
   storage.set(LS_ACTIVE, state.activeId);
+  
+  const isTauri = window.__TAURI__ || window.__TAURI_INTERNALS__ || window.origin?.includes("tauri") || location.protocol === "tauri:";
+  if (isTauri) {
+    const note = activeNote();
+    if (note) {
+      try {
+        await window.__TAURI__.core.invoke("db_save_note", { note });
+      } catch (err) {
+        console.error("[SQLite save error]", err);
+      }
+    }
+  } else {
+    storage.set(LS_NOTES, state.notes);
+  }
 }
 
 const persistSoon = debounce(persist, 180);
@@ -124,15 +172,26 @@ function setSyncState(next, label = null) {
   const text = label || {
     local: "Local",
     pending: "Pendiente",
-    syncing: "Sincronizando",
-    synced: "En la nube",
+    syncing: "Guardando",
+    synced: "Guardado",
     offline: "Sin conexion",
-    error: "Error de sync",
+    error: "Error",
   }[next];
   if (pill) {
     pill.dataset.state = next;
     $(".sync-label", pill).textContent = text;
   }
+
+  // Spin del botón de nube en el topbar durante sincronización
+  const cloudIco = $("#btnSyncManual i");
+  if (cloudIco) {
+    if (next === "syncing") {
+      cloudIco.classList.add("syncing-animate");
+    } else {
+      cloudIco.classList.remove("syncing-animate");
+    }
+  }
+
   renderMeta();
 }
 
@@ -145,98 +204,63 @@ function renderApp() {
           <button class="icon-btn" id="btnSidebar" title="Archivos">${icon("menu")}</button>
         </div>
         
-        <div class="tools-left">
-          <div class="tool-group">
-            <select class="select" id="fontFamily" title="Fuente">
-              <option value="Poppins">Poppins</option>
-              <option value="Segoe UI">Segoe UI</option>
-              <option value="Georgia">Georgia</option>
-              <option value="Consolas">Consolas</option>
-            </select>
-            <div class="tool-sep"></div>
-            <input class="number-input" id="fontSize" type="number" min="10" max="48" value="16" title="Tamaño" />
-          </div>
-          <div class="tool-group">
-            <button class="tool-btn" data-cmd="bold" title="Negrita">${icon("bold")}</button>
-            <button class="tool-btn" data-cmd="italic" title="Cursiva">${icon("italic")}</button>
-            <button class="tool-btn" data-cmd="underline" title="Subrayado">${icon("underline")}</button>
-            <button class="tool-btn" data-cmd="strikeThrough" title="Tachado">${icon("strike")}</button>
-          </div>
-          <div class="tool-group">
-            <button class="tool-btn" data-cmd="justifyLeft" title="Alinear izquierda">${icon("alignLeft")}</button>
-            <button class="tool-btn" data-cmd="justifyCenter" title="Centrar">${icon("alignCenter")}</button>
-            <button class="tool-btn" data-cmd="justifyRight" title="Alinear derecha">${icon("alignRight")}</button>
-            <button class="tool-btn" data-cmd="justifyFull" title="Justificar">${icon("alignJustify")}</button>
-          </div>
-          <div class="tool-group">
-            <button class="tool-btn" data-cmd="insertUnorderedList" title="Lista">${icon("list")}</button>
-            <button class="tool-btn" data-cmd="insertOrderedList" title="Numeración">${icon("listOrdered")}</button>
-            <div class="tool-sep"></div>
-            <select class="select select-small" id="lineHeight" title="Interlineado">
-              <option value="1">1.0</option>
-              <option value="1.15">1.15</option>
-              <option value="1.5">1.5</option>
-              <option value="2">2.0</option>
-            </select>
-          </div>
-          <div class="tool-group">
-            <span class="color-tool">${icon("font")}<input class="color-input" id="textColor" type="color" value="#1f1f1f" title="Color de texto" /></span>
-            <div class="tool-sep"></div>
-            <span class="color-tool">${icon("highlighter")}<input class="color-input" id="highlightColor" type="color" value="#fff176" title="Resaltado" /></span>
-          </div>
-        </div>
-
         <div class="topbar-right">
-          <button class="icon-btn tool-toggle-btn" id="btnToggleFormatting" title="Formato del texto">${icon("font")}</button>
-          <div class="meta-strip" id="metaStrip"></div>
+          <button class="icon-btn" id="btnToggleSearch" title="Buscar notas"><i class="fa-solid fa-magnifying-glass"></i></button>
+          <button class="icon-btn" id="btnToggleFormatting" title="Formato de texto"><i class="fa-solid fa-font"></i></button>
+          <button class="icon-btn sync-manual-btn" id="btnSyncManual" title="Sincronizar ahora">${icon("cloud")}</button>
+          <label class="rt-sync-label" id="rtSyncLabel" title="Tiempo real: ${realtimeSyncEnabled ? 'Activo' : 'Pausado'} — haz clic para ${realtimeSyncEnabled ? 'pausar' : 'activar'} la sincronización en tiempo real">
+            <input type="checkbox" id="rtSyncToggle" ${realtimeSyncEnabled ? 'checked' : ''} />
+            <span class="rt-sync-track">
+              <i class="fas ${realtimeSyncEnabled ? 'fa-cloud' : 'fa-cloud-arrow-up'} rt-sync-icon"></i>
+            </span>
+          </label>
+          <button class="icon-btn meta-status-btn" id="btnMetaInfo" title="Información de la nota"><i class="fa-solid fa-circle-info"></i></button>
           <div id="accountArea"></div>
         </div>
-
-        <!-- Panel de Formato Flotante para Pantallas Pequeñas -->
-        <div class="formatting-panel" id="panelFormatting">
-          <div class="tool-group">
-            <select class="select" id="fontFamilyMobile" title="Fuente">
-              <option value="Poppins">Poppins</option>
-              <option value="Segoe UI">Segoe UI</option>
-              <option value="Georgia">Georgia</option>
-              <option value="Consolas">Consolas</option>
-            </select>
-            <div class="tool-sep"></div>
-            <input class="number-input" id="fontSizeMobile" type="number" min="10" max="48" value="16" title="Tamaño" />
-          </div>
-          <div class="tool-group">
-            <button class="tool-btn" data-cmd="bold" title="Negrita">${icon("bold")}</button>
-            <button class="tool-btn" data-cmd="italic" title="Cursiva">${icon("italic")}</button>
-            <button class="tool-btn" data-cmd="underline" title="Subrayado">${icon("underline")}</button>
-            <button class="tool-btn" data-cmd="strikeThrough" title="Tachado">${icon("strike")}</button>
-          </div>
-          <div class="tool-group">
-            <button class="tool-btn" data-cmd="justifyLeft" title="Alinear izquierda">${icon("alignLeft")}</button>
-            <button class="tool-btn" data-cmd="justifyCenter" title="Centrar">${icon("alignCenter")}</button>
-            <button class="tool-btn" data-cmd="justifyRight" title="Alinear derecha">${icon("alignRight")}</button>
-            <button class="tool-btn" data-cmd="justifyFull" title="Justificar">${icon("alignJustify")}</button>
-          </div>
-          <div class="tool-group">
-            <span class="color-tool">${icon("font")}<input class="color-input" id="textColorMobile" type="color" value="#1f1f1f" title="Color" /></span>
-            <div class="tool-sep"></div>
-            <span class="color-tool">${icon("highlighter")}<input class="color-input" id="highlightColorMobile" type="color" value="#fff176" title="Resaltar" /></span>
-          </div>
-        </div>
       </header>
+
+      <div class="search-panel" id="searchPanel">
+        <div class="search-group">
+          ${icon("search")}
+          <input class="search-input-top" id="searchInput" placeholder="Buscar notas..." autocomplete="off" />
+        </div>
+      </div>
+
+      <div class="formatting-panel" id="formattingPanel">
+        <div class="tool-group">
+          <input class="number-input" id="fontSize" type="number" min="10" max="48" value="16" title="Tamaño de letra" />
+        </div>
+        <div class="tool-group">
+          <button class="tool-btn" data-cmd="bold" title="Negrita">${icon("bold")}</button>
+          <button class="tool-btn" data-cmd="italic" title="Cursiva">${icon("italic")}</button>
+        </div>
+        <div class="tool-group">
+          <button class="tool-btn" data-cmd="justifyLeft" title="Alinear izquierda">${icon("alignLeft")}</button>
+          <button class="tool-btn" data-cmd="justifyCenter" title="Centrar">${icon("alignCenter")}</button>
+          <button class="tool-btn" data-cmd="justifyRight" title="Alinear derecha">${icon("alignRight")}</button>
+          <button class="tool-btn" data-cmd="justifyFull" title="Justificar">${icon("alignJustify")}</button>
+        </div>
+        <div class="tool-group">
+          <button class="tool-btn" data-cmd="insertUnorderedList" title="Lista con viñetas">${icon("list")}</button>
+          <button class="tool-btn" data-cmd="insertOrderedList" title="Lista numerada">${icon("listOrdered")}</button>
+          <button class="tool-btn" id="btnLink" title="Insertar Enlace">${icon("link")}</button>
+        </div>
+        <div class="tool-group">
+          <span class="color-tool">${icon("font")}<input class="color-input" id="textColor" type="color" value="#1f1f1f" title="Color de texto" /></span>
+          <span class="color-tool">${icon("highlighter")}<input class="color-input" id="highlightColor" type="color" value="#fff176" title="Color de resaltado" /></span>
+        </div>
+      </div>
 
       <div class="workspace">
         <aside class="sidebar">
           <div class="sidebar-head">
-            <input class="title-input" id="titleInput" placeholder="Título del documento" autocomplete="off" />
-            <input class="search-input" id="searchInput" placeholder="Buscar notas..." autocomplete="off" />
-            <div class="doc-actions">
-              <button class="primary-btn" id="btnSync">${icon("cloud")} Sincronizar</button>
-              <button class="icon-btn" id="btnDelete" title="Eliminar">${icon("trash")}</button>
+            <div class="sidebar-head-row">
+              <h2>Archivos</h2>
+              <button class="icon-btn" id="btnNew" title="Nueva nota">${icon("plus")}</button>
             </div>
-          </div>
-          <div class="doc-list-head">
-            <div><h2>Archivos</h2><span class="doc-count">0 notas</span></div>
-            <button class="icon-btn" id="btnNew" title="Nueva nota">${icon("plus")}</button>
+            <div class="new-note-container">
+              <input class="new-note-input" id="newNoteInput" placeholder="Nueva nota... (Enter)" autocomplete="off" />
+            </div>
           </div>
           <div class="doc-list" id="docList"></div>
         </aside>
@@ -245,6 +269,7 @@ function renderApp() {
           <nav class="tabs" id="tabs"></nav>
           <section class="editor-shell">
             <article class="paper">
+              <input class="editor-title-input" id="titleInput" placeholder="Sin título" autocomplete="off" />
               <div id="editor" class="editor" contenteditable="true" spellcheck="false" data-placeholder="Comienza a escribir tus ideas..."></div>
             </article>
           </section>
@@ -252,17 +277,19 @@ function renderApp() {
       </div>
 
       <footer class="statusbar">
-        <div class="status-left"><button id="btnFocus" class="status-btn">${icon("focus")} <span>Modo Concentración</span></button></div>
+        <div class="status-left"><button id="btnFocus" class="status-btn">${icon("focus")} <span>Modo Zen</span></button></div>
         <div class="status-center">
-          <span>Tema:</span>
+          <span class="status-words-badge" id="wordCount" title="Contador de palabras">0</span>
+          <span class="status-theme-label">Tema:</span>
           <div class="theme-picker">
             ${["Oro", "Cielo", "Dulce", "Paz", "Mora", "Futuro"].map((theme) => `<button class="theme-dot" data-theme="${theme}" title="${theme}"></button>`).join("")}
           </div>
-          <button class="shortcuts-trigger-btn" id="btnShortcuts" title="Atajos de teclado">
-            <i class="fa-solid fa-keyboard"></i> <span>Atajos</span>
+        </div>
+        <div class="status-right">
+          <button class="shortcuts-trigger-btn" id="btnSettings" title="Ajustes de la aplicación">
+            <i class="fa-solid fa-gear"></i> <span>Ajustes</span>
           </button>
         </div>
-        <div class="status-right"><span id="wordCount">0 palabras</span><span>${app} Windows ${version}</span></div>
       </footer>
     </section>
     <div id="modalContainer"></div>
@@ -270,7 +297,14 @@ function renderApp() {
 
   bindEvents();
   applyTheme(storage.get("zenwii_theme", defaultTheme));
-  renderAll();
+  
+  // Cargar asíncronamente desde SQLite
+  dbLoadAll().then(() => {
+    renderAll();
+  }).catch((err) => {
+    console.error(err);
+    renderAll();
+  });
 }
 
 function runIdle(task) {
@@ -305,6 +339,10 @@ async function startCloudInBackground() {
   cloudListening = true;
   api.onUser((user) => {
     if (!user) {
+      if (unsubscribeNotes) {
+        unsubscribeNotes();
+        unsubscribeNotes = null;
+      }
       state.user = null;
       storage.set("zenwii_cached_user", null); // Limpiar sesión en caché
       renderAccount();
@@ -366,13 +404,14 @@ function renderAccount() {
             <path d="M3.964 10.705A5.41 5.41 0 0 1 3.682 9c0-.593.102-1.17.282-1.705V4.963H.957A8.996 8.996 0 0 0 0 9c0 1.452.348 2.827.957 4.037l3.007-2.332z" fill="#FBBC05"/>
             <path d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.963L3.964 7.295C4.672 5.163 6.656 3.58 9 3.58z" fill="#EA4335"/>
           </svg>
-          Iniciar sesión
+          Login
         </button>
       </div>
     `;
     return;
   }
-  const displayName = state.user.nombre || state.user.usuario || state.user.displayName || state.user.email || "Usuario";
+  const fullName = state.user.nombre && state.user.apellidos ? `${state.user.nombre} ${state.user.apellidos}` : state.user.nombre;
+  const displayName = fullName || state.user.usuario || state.user.displayName || state.user.email || "Usuario";
   const avatarUrl = state.user.avatar || state.user.photoURL || state.user.photoUrl;
   area.innerHTML = `
     <div class="user-dropdown-container">
@@ -404,7 +443,8 @@ function showProfileModal() {
   const container = $("#modalContainer");
   if (!container || !state.user) return;
   
-  const displayName = state.user.nombre || state.user.usuario || state.user.displayName || state.user.email || "Usuario";
+  const fullName = state.user.nombre && state.user.apellidos ? `${state.user.nombre} ${state.user.apellidos}` : state.user.nombre;
+  const displayName = fullName || state.user.usuario || state.user.displayName || state.user.email || "Usuario";
   const avatarUrl = state.user.avatar || state.user.photoURL || state.user.photoUrl;
   const email = state.user.email || "Sin correo";
   const role = state.user.rol || "smile";
@@ -455,65 +495,197 @@ function closeProfileModal() {
   if (container) container.innerHTML = "";
 }
 
-function showShortcutsModal() {
+function showSettingsModal() {
   const container = $("#modalContainer");
   if (!container) return;
   
+  const isTauri = window.__TAURI__ || window.__TAURI_INTERNALS__ || window.origin?.includes("tauri") || location.protocol === "tauri:";
+  
   container.innerHTML = `
-    <div class="modal-backdrop active" id="shortcutsModalBackdrop">
-      <div class="modal shortcuts-modal">
+    <div class="modal-backdrop active" id="settingsModalBackdrop">
+      <div class="modal settings-modal glassmorphic animate-in">
         <div class="modal-head">
-          <h2>${icon("feather")} Atajos del Teclado</h2>
-          <button class="icon-btn" id="btnCloseShortcutsModal" title="Cerrar">${icon("x")}</button>
+          <h2>${icon("feather")} Ajustes del Sistema</h2>
+          <button class="icon-btn" id="btnCloseSettingsModal" title="Cerrar">${icon("x")}</button>
         </div>
-        <div class="shortcuts-modal-content">
-          <p class="shortcuts-subtitle">Aumenta tu productividad al escribir y gestionar tus notas con atajos premium rápidos.</p>
-          <div class="shortcuts-grid">
-            <div class="shortcut-row">
-              <span class="shortcut-desc">Sincronizar en Firebase</span>
-              <div class="shortcut-keys"><kbd>Ctrl</kbd> + <kbd>S</kbd></div>
+        <div class="settings-modal-content">
+          <div class="settings-tab-section">
+            <h3>Configuración General</h3>
+            <div class="settings-row">
+              <span class="settings-label">Motor de Base de Datos:</span>
+              <span class="settings-val badge-val">${isTauri ? "SQLite Nativo (Bundled)" : "LocalStorage Fallback"}</span>
             </div>
-            <div class="shortcut-row">
-              <span class="shortcut-desc">Nueva nota / Pestaña</span>
-              <div class="shortcut-keys"><kbd>Ctrl</kbd> + <kbd>N</kbd></div>
+            <div class="settings-row">
+              <span class="settings-label">Estado Offline:</span>
+              <span class="settings-val badge-val">${navigator.onLine ? "Sincronizado" : "Modo Sin Conexión"}</span>
             </div>
-            <div class="shortcut-row">
-              <span class="shortcut-desc">Cerrar modales o salir de Modo Concentración</span>
-              <div class="shortcut-keys"><kbd>Esc</kbd></div>
+            <div class="settings-row">
+              <span class="settings-label">Mantenimiento:</span>
+              <button class="btn btn-secondary compact-settings-btn" id="btnClearCacheBtn" title="Limpia cookies y sesión del sistema">${icon("trash")} Limpiar Sesión</button>
             </div>
           </div>
+          
+          <div class="settings-tab-section">
+            <h3>Atajos del Teclado</h3>
+            <div class="shortcuts-grid">
+              <div class="shortcut-row">
+                <span class="shortcut-desc">Sincronizar en Firebase</span>
+                <div class="shortcut-keys"><kbd>Ctrl</kbd> + <kbd>S</kbd></div>
+              </div>
+              <div class="shortcut-row">
+                <span class="shortcut-desc">Nueva nota / Pestaña</span>
+                <div class="shortcut-keys"><kbd>Ctrl</kbd> + <kbd>N</kbd></div>
+              </div>
+              <div class="shortcut-row">
+                <span class="shortcut-desc">Cerrar modales o salir de Modo Zen</span>
+                <div class="shortcut-keys"><kbd>Esc</kbd></div>
+              </div>
+            </div>
+          </div>
+          
           <div class="shortcuts-brand-footer">
             <img class="shortcuts-logo" src="/icon.png" alt="Zenwii Logo" />
-            <span>Zenwii Premium para Windows</span>
+            <span>${app} Windows v${version}</span>
           </div>
         </div>
       </div>
     </div>
   `;
+  
+  const close = () => { container.innerHTML = ""; };
+  document.getElementById("btnCloseSettingsModal")?.addEventListener("click", close);
+  document.getElementById("settingsModalBackdrop")?.addEventListener("click", (e) => {
+    if (e.target.id === "settingsModalBackdrop") close();
+  });
+  
+  document.getElementById("btnClearCacheBtn")?.addEventListener("click", async () => {
+    close();
+    if (unsubscribeNotes) {
+      unsubscribeNotes();
+      unsubscribeNotes = null;
+    }
+    state.user = null;
+    storage.set("zenwii_cached_user", null);
+    renderAccount();
+    const api = await loadCloudApi();
+    await api?.logout();
+    
+    if (window.wisafe && typeof window.wisafe.salir === "function") {
+      window.wisafe.salir(["wiTema", "wiSmart", "cookiesPrivacidad"]).then(() => {
+        location.reload();
+      });
+    } else {
+      location.reload();
+    }
+  });
 }
 
-function closeShortcutsModal() {
+function showMetaModal() {
   const container = $("#modalContainer");
-  if (container) container.innerHTML = "";
+  if (!container) return;
+  
+  const note = activeNote();
+  if (!note) return;
+  
+  const stateText = {
+    local: "Guardado localmente en SQLite",
+    pending: "Cambios locales pendientes de sincronizar",
+    syncing: "Sincronizando con Firebase Firestore...",
+    synced: "Sincronizado correctamente en la nube",
+    offline: "Sin conexión a internet (Modo Offline)",
+    error: "Error de sincronización con la nube",
+  }[state.syncState] || "Guardado local";
+  
+  container.innerHTML = `
+    <div class="modal-backdrop active" id="metaModalBackdrop">
+      <div class="modal meta-info-modal glassmorphic animate-in">
+        <div class="modal-head">
+          <h2>${icon("feather")} Info del Documento</h2>
+          <button class="icon-btn" id="btnCloseMetaModal" title="Cerrar">${icon("x")}</button>
+        </div>
+        <div class="modal-body meta-modal-body">
+          <div class="meta-detail-row">
+            <span class="meta-detail-label">Título:</span>
+            <span class="meta-detail-value">${escapeHtml(note.title || "Documento sin título")}</span>
+          </div>
+          <div class="meta-detail-row">
+            <span class="meta-detail-label">Estado:</span>
+            <span class="meta-detail-value badge-val state-${state.syncState}">${stateText}</span>
+          </div>
+          <div class="meta-detail-row">
+            <span class="meta-detail-label">Creado:</span>
+            <span class="meta-detail-value">${formatDateTime(note.created)}</span>
+          </div>
+          <div class="meta-detail-row">
+            <span class="meta-detail-label">Modificado:</span>
+            <span class="meta-detail-value">${formatDateTime(note.updated)}</span>
+          </div>
+          <div class="meta-detail-row">
+            <span class="meta-detail-label">ID de Nota:</span>
+            <span class="meta-detail-value code-val">${note.id}</span>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-primary" id="btnOkMeta">Aceptar</button>
+        </div>
+      </div>
+    </div>
+  `;
+  
+  const close = () => { container.innerHTML = ""; };
+  document.getElementById("btnCloseMetaModal")?.addEventListener("click", close);
+  document.getElementById("btnOkMeta")?.addEventListener("click", close);
+  document.getElementById("metaModalBackdrop")?.addEventListener("click", (e) => {
+    if (e.target.id === "metaModalBackdrop") close();
+  });
 }
 
 function renderMeta() {
   const note = activeNote();
-  const meta = $("#metaStrip");
-  if (!meta || !note) return;
-  const stateText = {
-    local: "Local",
-    pending: "Pendiente",
-    syncing: "Sincronizando",
-    synced: "En la nube",
-    offline: "Sin conexion",
-    error: "Error",
-  }[state.syncState] || "Local";
-  meta.innerHTML = `
-    <span class="meta-item">${icon(note.synced ? "cloud" : "upload")} <span>${stateText}</span></span>
-    <span class="meta-item"><span id="updatedAt">Actualizado ${formatDateTime(note.updated)}</span></span>
-    <span class="meta-item meta-created">Creado ${formatDateTime(note.created)}</span>
-  `;
+  const syncBtn = $("#btnSyncManual");
+  const infoBtn = $("#btnMetaInfo");
+  if (!note) return;
+  
+  if (syncBtn) {
+    syncBtn.innerHTML = icon("cloud");
+    
+    if (note.synced && state.syncState === "synced") {
+      syncBtn.style.color = "var(--success)";
+      syncBtn.style.filter = "drop-shadow(0 0 3px var(--success))";
+    } else if (state.syncState === "syncing") {
+      syncBtn.style.color = "var(--warning)";
+      syncBtn.style.filter = "none";
+    } else {
+      syncBtn.style.color = "#8c8c8c";
+      syncBtn.style.filter = "none";
+    }
+    
+    // Spin only during syncing
+    const syncIco = syncBtn.querySelector("i");
+    if (syncIco) {
+      if (state.syncState === "syncing") {
+        syncIco.classList.add("syncing-animate");
+      } else {
+        syncIco.classList.remove("syncing-animate");
+      }
+    }
+    
+    const stateText = {
+      local: "Guardado local",
+      pending: "Cambios locales pendientes",
+      syncing: "Guardando cambio...",
+      synced: "Guardado exitosamente",
+      offline: "Sin conexión",
+      error: "Error al guardar",
+    }[state.syncState] || "Local";
+    syncBtn.title = `${stateText} — clic para sincronizar`;
+  }
+  
+  if (infoBtn) {
+    infoBtn.innerHTML = icon("info");
+    infoBtn.style.color = "var(--accent-strong)";
+    infoBtn.title = "Información del documento";
+  }
 }
 
 function renderDocs() {
@@ -529,7 +701,13 @@ function renderDocs() {
         const cloud = note.synced ? icon("cloud") : icon("upload");
         return `
           <button class="doc-card ${active} ${note.pinned ? "pinned" : ""}" data-id="${note.id}">
-            <div class="doc-card-title"><h3>${escapeHtml(note.title || "Documento sin título")}</h3><span>${note.pinned ? icon("pin") : ""}</span></div>
+            <div class="doc-card-title">
+              <h3>${escapeHtml(note.title || "Documento sin título")}</h3>
+              <span class="card-icons">
+                ${note.pinned ? icon("pin") : ""}
+                <span class="delete-card-btn" data-id="${note.id}" title="Eliminar nota">${icon("trash")}</span>
+              </span>
+            </div>
             <p>${escapeHtml(snippet)}</p>
             <div class="doc-meta"><span>${relativeTime(note.updated)}</span><span>${cloud}</span></div>
           </button>
@@ -561,7 +739,10 @@ function renderEditor() {
   if (!note) return;
   const titleInput = $("#titleInput");
   if (titleInput) titleInput.value = note.title || "";
-  $("#editor").innerHTML = note.content || "";
+  const editor = $("#editor");
+  if (editor) {
+    editor.innerHTML = note.content || "";
+  }
   updateStats();
 }
 
@@ -575,11 +756,12 @@ function renderAll({ editor = true } = {}) {
   persist();
 }
 
-function createNote() {
+async function createNote() {
   const note = {
     id: uid(),
     title: "",
     content: "",
+    contentMd: "",
     pinned: false,
     created: Date.now(),
     updated: Date.now(),
@@ -589,6 +771,16 @@ function createNote() {
   state.notes.unshift(note);
   state.activeId = note.id;
   state.openTabs.push(note.id);
+  
+  const isTauri = window.__TAURI__ || window.__TAURI_INTERNALS__ || window.origin?.includes("tauri") || location.protocol === "tauri:";
+  if (isTauri) {
+    try {
+      await window.__TAURI__.core.invoke("db_save_note", { note });
+    } catch (err) {
+      console.error("[SQLite save note error]", err);
+    }
+  }
+  
   renderAll();
   $("#titleInput").focus();
 }
@@ -598,6 +790,7 @@ function markChanged() {
   if (!note) return;
   note.title = $("#titleInput").value.trim();
   note.content = $("#editor").innerHTML;
+  note.contentMd = htmlToMarkdown(note.content);
   note.updated = Date.now();
   note.synced = false;
   persistSoon();
@@ -607,7 +800,7 @@ function markChanged() {
   autoSync();
 }
 
-const autoSync = debounce(() => syncActiveNote(false), 900);
+const autoSync = debounce(() => realtimeSyncEnabled ? syncActiveNote(false) : null, 900);
 
 async function syncActiveNote(manual = true) {
   const note = activeNote();
@@ -630,14 +823,33 @@ async function syncActiveNote(manual = true) {
   }
   try {
     setSyncState("syncing");
-    await api.saveRemoteNote(state.user, note);
+    note.contentMd = htmlToMarkdown(note.content);
+    const oldId = note.id;
+    const syncedId = await api.saveRemoteNote(state.user, note);
     note.synced = true;
     note.remote = true;
     note.updated = Date.now();
+
+    if (syncedId && syncedId !== oldId) {
+      note.id = syncedId;
+      state.openTabs = state.openTabs.map((tid) => (tid === oldId ? syncedId : tid));
+      if (state.activeId === oldId) {
+        state.activeId = syncedId;
+      }
+      const isTauri = window.__TAURI__ || window.__TAURI_INTERNALS__ || window.origin?.includes("tauri") || location.protocol === "tauri:";
+      if (isTauri) {
+        try {
+          await window.__TAURI__.core.invoke("db_delete_note", { id: oldId });
+        } catch (err) {
+          console.error("[SQLite delete old note error]", err);
+        }
+      }
+    }
+
     persist();
     renderDocs();
     setSyncState("synced");
-    if (manual) notify("Sincronizado con Firebase.", "success");
+    if (manual) notify("Guardado exitosamente.", "success");
   } catch (error) {
     console.error("[sync]", error);
     setSyncState("error");
@@ -653,9 +865,26 @@ async function syncAllPending() {
   if (!pending.length) return;
   setSyncState("syncing");
   for (const note of pending) {
-    await api.saveRemoteNote(state.user, note);
+    note.contentMd = htmlToMarkdown(note.content);
+    const oldId = note.id;
+    const syncedId = await api.saveRemoteNote(state.user, note);
     note.synced = true;
     note.remote = true;
+    if (syncedId && syncedId !== oldId) {
+      note.id = syncedId;
+      state.openTabs = state.openTabs.map((tid) => (tid === oldId ? syncedId : tid));
+      if (state.activeId === oldId) {
+        state.activeId = syncedId;
+      }
+      const isTauri = window.__TAURI__ || window.__TAURI_INTERNALS__ || window.origin?.includes("tauri") || location.protocol === "tauri:";
+      if (isTauri) {
+        try {
+          await window.__TAURI__.core.invoke("db_delete_note", { id: oldId });
+        } catch (err) {
+          console.error("[SQLite delete old note error]", err);
+        }
+      }
+    }
   }
   persist();
   renderDocs();
@@ -667,18 +896,79 @@ async function loadCloudIntoLocal(api = cloudApi) {
   if (!api) return;
   try {
     setSyncState("syncing");
-    const remote = await api.loadRemoteNotes(state.user);
-    const byId = new Map(state.notes.map((note) => [note.id, note]));
-    remote.forEach((note) => {
-      const local = byId.get(note.id);
-      if (!local || (note.updated || 0) >= (local.updated || 0)) byId.set(note.id, note);
-    });
-    state.notes = [...byId.values()];
-    if (!state.notes.length) createNote();
-    if (!state.activeId || !state.notes.some((note) => note.id === state.activeId)) state.activeId = sortedNotes()[0]?.id;
+    
+    // Desvincular suscripción previa si existe
+    if (unsubscribeNotes) {
+      unsubscribeNotes();
+      unsubscribeNotes = null;
+    }
+    
+    if (realtimeSyncEnabled) {
+      // Iniciar suscripción en tiempo real
+      unsubscribeNotes = api.subscribeRemoteNotes(state.user, async (remoteNotes) => {
+        const byId = new Map(state.notes.map((note) => [note.id, note]));
+        let changed = false;
+        
+        remoteNotes.forEach((note) => {
+          const local = byId.get(note.id);
+          
+          // Si es una nota nueva o tiene cambios más recientes en la nube
+          if (!local || (note.updated || 0) > (local.updated || 0)) {
+            // Si el usuario está editando activamente esta nota, evitamos sobrescribir para no perder foco
+            if (local && local.id === state.activeId && document.activeElement === document.getElementById("editor")) {
+              console.log("[Sync] Obviando sobrescritura en caliente para evitar pérdida de foco.");
+              return;
+            }
+            byId.set(note.id, note);
+            changed = true;
+          }
+        });
+        
+        // Mantener las notas locales no sincronizadas todavía
+        state.notes.forEach((note) => {
+          if (!note.synced && !byId.has(note.id)) {
+            byId.set(note.id, note);
+          }
+        });
+        
+        if (changed || !state.notes.length) {
+          state.notes = [...byId.values()];
+          if (!state.notes.length) createNote();
+          if (!state.activeId || !state.notes.some((note) => note.id === state.activeId)) {
+            state.activeId = sortedNotes()[0]?.id;
+          }
+          
+          // Renderizar el editor solo si no tiene el foco activo para no interrumpir la escritura
+          renderAll({ editor: document.activeElement !== document.getElementById("editor") });
+        }
+        setSyncState("synced");
+      });
+    } else {
+      // Modo sin tiempo real: carga única (snapshot)
+      const remoteNotes = await api.loadRemoteNotesOnce(state.user);
+      if (remoteNotes && remoteNotes.length) {
+        const byId = new Map(state.notes.map((note) => [note.id, note]));
+        remoteNotes.forEach((note) => {
+          const local = byId.get(note.id);
+          if (!local || (note.updated || 0) > (local.updated || 0)) {
+            byId.set(note.id, note);
+          }
+        });
+        state.notes.forEach((note) => {
+          if (!note.synced && !byId.has(note.id)) byId.set(note.id, note);
+        });
+        state.notes = [...byId.values()];
+        if (!state.notes.length) createNote();
+        if (!state.activeId || !state.notes.some((note) => note.id === state.activeId)) {
+          state.activeId = sortedNotes()[0]?.id;
+        }
+        renderAll({ editor: document.activeElement !== document.getElementById("editor") });
+      }
+      setSyncState("synced");
+    }
+    
+    // Sincronizar cualquier nota local pendiente acumulada en offline
     await syncAllPending();
-    renderAll();
-    setSyncState("synced");
   } catch (error) {
     console.error("[cloud-load]", error);
     setSyncState("error");
@@ -686,29 +976,144 @@ async function loadCloudIntoLocal(api = cloudApi) {
   }
 }
 
-async function deleteActiveNote() {
-  const note = activeNote();
+async function deleteNote(note) {
   if (!note) return;
-  const ok = confirm(`Eliminar "${note.title || "Documento sin titulo"}"?`);
-  if (!ok) return;
-  state.notes = state.notes.filter((item) => item.id !== note.id);
-  state.openTabs = state.openTabs.filter((id) => id !== note.id);
-  if (state.user && note.remote) {
-    loadCloudApi().then((api) => api?.deleteRemoteNote(state.user, note.id)).catch(console.error);
-  }
-  if (!state.notes.length) state.notes.push(demoNote());
-  state.activeId = sortedNotes()[0].id;
-  renderAll();
-  notify("Nota eliminada.", "info");
+  
+  showDeleteModalForNote(note, async () => {
+    state.notes = state.notes.filter((item) => item.id !== note.id);
+    state.openTabs = state.openTabs.filter((id) => id !== note.id);
+    
+    const isTauri = window.__TAURI__ || window.__TAURI_INTERNALS__ || window.origin?.includes("tauri") || location.protocol === "tauri:";
+    if (isTauri) {
+      try {
+        await window.__TAURI__.core.invoke("db_delete_note", { id: note.id });
+      } catch (err) {
+        console.error("[SQLite delete note error]", err);
+      }
+    }
+    
+    if (state.user && note.remote) {
+      loadCloudApi().then((api) => api?.deleteRemoteNote(state.user, note.id)).catch(console.error);
+    }
+    
+    if (!state.notes.length) {
+      const dNote = demoNote();
+      state.notes.push(dNote);
+      if (isTauri) {
+        await window.__TAURI__.core.invoke("db_save_note", { note: dNote });
+      }
+    }
+    
+    if (state.activeId === note.id) {
+      state.activeId = sortedNotes()[0].id;
+    }
+    renderAll();
+    notify("Nota eliminada.", "info");
+  });
 }
 
 function updateStats() {
   const note = activeNote();
   const words = textFromHtml(note?.content || "").split(/\s+/).filter(Boolean).length;
   const wordCount = $("#wordCount");
-  if (wordCount) wordCount.textContent = `${words} palabra${words === 1 ? "" : "s"}`;
-  const updatedAt = $("#updatedAt");
-  if (updatedAt) updatedAt.textContent = note ? `Actualizado ${formatDateTime(note.updated)}` : "Ahora";
+  if (wordCount) wordCount.textContent = words;
+}
+
+function showDeleteModalForNote(note, onConfirm) {
+  const container = document.getElementById("modalContainer");
+  if (!container) return;
+  container.innerHTML = `
+    <div class="modal-backdrop active" id="deleteModalBackdrop">
+      <div class="modal delete-modal glassmorphic animate-in">
+        <div class="modal-head">
+          <h2>${icon("trash")} ¿Eliminar nota?</h2>
+          <button class="icon-btn" id="btnCloseDeleteModal" title="Cerrar">${icon("x")}</button>
+        </div>
+        <div class="modal-body">
+          <p>¿Estás seguro de que deseas eliminar la nota <strong>"${escapeHtml(note.title || "sin título")}"</strong>? Esta acción es permanente y borrará la nota de tu disco local y de la nube.</p>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="btnCancelDelete">Cancelar</button>
+          <button class="btn btn-danger" id="btnConfirmDelete">Eliminar</button>
+        </div>
+      </div>
+    </div>
+  `;
+  const close = () => { container.innerHTML = ""; };
+  document.getElementById("btnCloseDeleteModal")?.addEventListener("click", close);
+  document.getElementById("btnCancelDelete")?.addEventListener("click", close);
+  document.getElementById("btnConfirmDelete")?.addEventListener("click", () => {
+    close();
+    onConfirm();
+  });
+  document.getElementById("deleteModalBackdrop")?.addEventListener("click", (e) => {
+    if (e.target.id === "deleteModalBackdrop") close();
+  });
+}
+
+function showLinkModal() {
+  const container = document.getElementById("modalContainer");
+  if (!container) return;
+  
+  const selection = window.getSelection();
+  let savedRange = null;
+  if (selection.rangeCount > 0) {
+    savedRange = selection.getRangeAt(0).cloneRange();
+  }
+  
+  container.innerHTML = `
+    <div class="modal-backdrop active" id="linkModalBackdrop">
+      <div class="modal link-modal glassmorphic animate-in">
+        <div class="modal-head">
+          <h2>${icon("link")} Insertar Enlace</h2>
+          <button class="icon-btn" id="btnCloseLinkModal" title="Cerrar">${icon("x")}</button>
+        </div>
+        <div class="modal-body">
+          <input class="title-input" id="linkText" placeholder="Texto del enlace (opcional)" autocomplete="off" />
+          <input class="search-input" id="linkUrl" placeholder="https://ejemplo.com" autocomplete="off" />
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="btnCancelLink">Cancelar</button>
+          <button class="btn btn-primary" id="btnConfirmLink">Insertar</button>
+        </div>
+      </div>
+    </div>
+  `;
+  
+  const close = () => { container.innerHTML = ""; };
+  
+  const linkText = document.getElementById("linkText");
+  const linkUrl = document.getElementById("linkUrl");
+  if (linkText && savedRange) {
+    linkText.value = savedRange.toString();
+  }
+  
+  linkUrl?.focus();
+  
+  document.getElementById("btnCloseLinkModal")?.addEventListener("click", close);
+  document.getElementById("btnCancelLink")?.addEventListener("click", close);
+  document.getElementById("btnConfirmLink")?.addEventListener("click", () => {
+    const url = linkUrl?.value.trim();
+    const text = linkText?.value.trim() || url;
+    if (url) {
+      if (savedRange) {
+        selection.removeAllRanges();
+        selection.addRange(savedRange);
+      }
+      if (!savedRange || savedRange.collapsed) {
+        const html = `<a href="${escapeHtml(url)}" target="_blank">${escapeHtml(text)}</a>`;
+        document.execCommand("insertHTML", false, html);
+      } else {
+        document.execCommand("createLink", false, url);
+      }
+      markChanged();
+    }
+    close();
+  });
+  
+  document.getElementById("linkModalBackdrop")?.addEventListener("click", (e) => {
+    if (e.target.id === "linkModalBackdrop") close();
+  });
 }
 
 function exec(command, value = null) {
@@ -736,27 +1141,98 @@ function bindEvents() {
     $("#shell").classList.toggle("sidebar-closed");
   });
 
-  // Toggle formatting panel
-  $("#btnToggleFormatting")?.addEventListener("click", () => {
-    $("#panelFormatting")?.classList.toggle("active");
-  });
-
   // Main controls
   $("#btnFocus")?.addEventListener("click", () => $("#shell").classList.toggle("focus"));
   $("#btnNew")?.addEventListener("click", createNote);
-  $("#btnDelete")?.addEventListener("click", deleteActiveNote);
-  $("#btnSync")?.addEventListener("click", () => syncActiveNote(true));
   $("#titleInput")?.addEventListener("input", markChanged);
   $("#editor")?.addEventListener("input", markChanged);
+  $("#newNoteInput")?.addEventListener("keydown", async (e) => {
+    if (e.key === "Enter") {
+      const title = e.target.value.trim();
+      if (!title) return;
+      e.target.value = "";
+      
+      const note = {
+        id: uid(),
+        title: title,
+        content: "",
+        contentMd: "",
+        pinned: false,
+        created: Date.now(),
+        updated: Date.now(),
+        synced: false,
+        remote: false,
+      };
+      
+      state.notes.unshift(note);
+      state.activeId = note.id;
+      state.openTabs.push(note.id);
+      
+      const isTauri = window.__TAURI__ || window.__TAURI_INTERNALS__ || window.origin?.includes("tauri") || location.protocol === "tauri:";
+      if (isTauri) {
+        try {
+          await window.__TAURI__.core.invoke("db_save_note", { note });
+        } catch (err) {
+          console.error("[SQLite save note error]", err);
+        }
+      }
+      
+      renderAll();
+      $("#editor").focus();
+      notify("Nota creada: " + title, "success");
+    }
+  });
+  $("#editor")?.addEventListener("keydown", (e) => {
+    if (e.key === " ") {
+      const selection = window.getSelection();
+      if (!selection.rangeCount) return;
+      const range = selection.getRangeAt(0);
+      const node = range.startContainer;
+      if (node.nodeType === Node.TEXT_NODE) {
+        const text = node.textContent;
+        const startOffset = range.startOffset;
+        if (text.startsWith("#") && startOffset === 1) {
+          e.preventDefault();
+          node.textContent = text.slice(1);
+          document.execCommand("formatBlock", false, "h1");
+        } else if (text.startsWith("##") && startOffset === 2) {
+          e.preventDefault();
+          node.textContent = text.slice(2);
+          document.execCommand("formatBlock", false, "h2");
+        } else if (text.startsWith("###") && startOffset === 3) {
+          e.preventDefault();
+          node.textContent = text.slice(3);
+          document.execCommand("formatBlock", false, "h3");
+        } else if (text.startsWith("-") && startOffset === 1) {
+          e.preventDefault();
+          node.textContent = text.slice(1);
+          document.execCommand("insertUnorderedList");
+        } else if (text.startsWith("1.") && startOffset === 2) {
+          e.preventDefault();
+          node.textContent = text.slice(2);
+          document.execCommand("insertOrderedList");
+        }
+      }
+    }
+  });
+
   $("#searchInput")?.addEventListener("input", (event) => {
     state.query = event.target.value;
     renderDocs();
   });
 
   document.addEventListener("click", async (event) => {
-    // Click outside panel formatting closes it
-    if (!event.target.closest("#btnToggleFormatting") && !event.target.closest("#panelFormatting")) {
-      $("#panelFormatting")?.classList.remove("active");
+    // Intercept click on delete-card-btn
+    const deleteCardBtn = event.target.closest(".delete-card-btn");
+    if (deleteCardBtn) {
+      event.stopPropagation();
+      event.preventDefault();
+      const noteId = deleteCardBtn.dataset.id;
+      const noteToDelete = state.notes.find((n) => n.id === noteId);
+      if (noteToDelete) {
+        deleteNote(noteToDelete);
+      }
+      return;
     }
 
     // Toggle user dropdown on click
@@ -822,9 +1298,16 @@ function bindEvents() {
       $("#btnUserMenu")?.classList.remove("active");
       showProfileModal();
     }
+    if (event.target.closest("#btnLink")) {
+      showLinkModal();
+    }
     if (event.target.closest("#btnLogout") || event.target.closest("#btnLogoutDropdown")) {
       $("#userMenuDropdown")?.classList.remove("active");
       $("#btnUserMenu")?.classList.remove("active");
+      if (unsubscribeNotes) {
+        unsubscribeNotes();
+        unsubscribeNotes = null;
+      }
       state.user = null;
       storage.set("zenwii_cached_user", null); // Limpiar sesión en caché al instante
       renderAccount();
@@ -832,14 +1315,44 @@ function bindEvents() {
       await api?.logout();
       notify("Sesión cerrada. Tus notas locales siguen aquí.", "info");
     }
-    if (event.target.closest("#btnShortcuts")) {
-      showShortcutsModal();
+    if (event.target.closest("#btnSettings")) {
+      showSettingsModal();
+    }
+    if (event.target.closest("#btnMetaInfo")) {
+      showMetaModal();
+    }
+    if (event.target.closest("#btnSyncManual")) {
+      syncActiveNote(true);
+    }
+    if (event.target.closest("#btnToggleSearch")) {
+      $("#searchPanel")?.classList.toggle("active");
+      $("#btnToggleSearch")?.classList.toggle("active");
+      if ($("#searchPanel")?.classList.contains("active")) {
+        $("#searchInput")?.focus();
+        $("#formattingPanel")?.classList.remove("active");
+        $("#btnToggleFormatting")?.classList.remove("active");
+      }
+    }
+    if (event.target.closest("#btnToggleFormatting")) {
+      $("#formattingPanel")?.classList.toggle("active");
+      $("#btnToggleFormatting")?.classList.toggle("active");
+      if ($("#formattingPanel")?.classList.contains("active")) {
+        $("#searchPanel")?.classList.remove("active");
+        $("#btnToggleSearch")?.classList.remove("active");
+      }
+    }
+    
+    if (!event.target.closest("#formattingPanel") && !event.target.closest("#btnToggleFormatting") &&
+        !event.target.closest("#searchPanel") && !event.target.closest("#btnToggleSearch")) {
+      $("#formattingPanel")?.classList.remove("active");
+      $("#btnToggleFormatting")?.classList.remove("active");
+      $("#searchPanel")?.classList.remove("active");
+      $("#btnToggleSearch")?.classList.remove("active");
     }
   });
 
   // Direct Desktop Text Formatting Controls
   $$(".tool-btn[data-cmd]").forEach((button) => button.addEventListener("click", () => exec(button.dataset.cmd)));
-  $("#fontFamily")?.addEventListener("change", (event) => exec("fontName", event.target.value));
   $("#fontSize")?.addEventListener("change", (event) => {
     const size = Math.max(10, Math.min(48, Number(event.target.value) || 16));
     const editor = $("#editor");
@@ -848,23 +1361,6 @@ function bindEvents() {
   });
   $("#textColor")?.addEventListener("input", (event) => exec("foreColor", event.target.value));
   $("#highlightColor")?.addEventListener("input", (event) => exec("hiliteColor", event.target.value));
-  $("#lineHeight")?.addEventListener("change", (event) => {
-    document.execCommand("lineHeight", false, event.target.value);
-    const editor = $("#editor");
-    if (editor) editor.style.lineHeight = event.target.value;
-    markChanged();
-  });
-
-  // Floating Mobile Text Formatting Controls
-  $("#fontFamilyMobile")?.addEventListener("change", (event) => exec("fontName", event.target.value));
-  $("#fontSizeMobile")?.addEventListener("change", (event) => {
-    const size = Math.max(10, Math.min(48, Number(event.target.value) || 16));
-    const editor = $("#editor");
-    if (editor) editor.style.fontSize = `${size}px`;
-    markChanged();
-  });
-  $("#textColorMobile")?.addEventListener("input", (event) => exec("foreColor", event.target.value));
-  $("#highlightColorMobile")?.addEventListener("input", (event) => exec("hiliteColor", event.target.value));
 
   $$(".theme-dot").forEach((dot) => {
     dot.addEventListener("click", () => {
@@ -876,21 +1372,55 @@ function bindEvents() {
     });
   });
 
-
   window.addEventListener("online", () => {
     setSyncState("pending");
     scheduleCloudBoot();
     syncAllPending().catch(console.error);
   });
   window.addEventListener("offline", () => setSyncState("offline"));
+
+  // Real-time sync toggle handler
+  document.addEventListener("change", (event) => {
+    if (event.target.id === "rtSyncToggle") {
+      const on = event.target.checked;
+      realtimeSyncEnabled = on;
+      storage.set("zenwii_realtime_sync", on);
+      
+      const rtIcon = document.querySelector(".rt-sync-icon");
+      if (rtIcon) rtIcon.className = `fas ${on ? "fa-cloud" : "fa-cloud-arrow-up"} rt-sync-icon`;
+      const rtLabel = document.getElementById("rtSyncLabel");
+      if (rtLabel) rtLabel.title = `Tiempo real: ${on ? "Activo" : "Pausado"}`;
+
+      if (on && state.user) {
+        // Reanudar: cargar nube y refrescar editor inmediatamente
+        notify("Tiempo real activado. Actualizando...", "info", 2000);
+        loadCloudApi().then(async (api) => {
+          if (!api) return;
+          await loadCloudIntoLocal(api);
+          // Forzar render del editor con el contenido más reciente
+          renderEditor();
+        }).catch(console.error);
+      } else if (!on && unsubscribeNotes) {
+        unsubscribeNotes();
+        unsubscribeNotes = null;
+        setSyncState(state.syncState === "syncing" ? "synced" : state.syncState);
+        notify("Tiempo real pausado. Ctrl+S para guardar en la nube.", "info", 2500);
+      }
+    }
+  });
+
   window.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       if ($("#shell").classList.contains("focus")) $("#shell").classList.remove("focus");
-      $("#panelFormatting")?.classList.remove("active");
       $("#userMenuDropdown")?.classList.remove("active");
       $("#btnUserMenu")?.classList.remove("active");
+      $("#formattingPanel")?.classList.remove("active");
+      $("#btnToggleFormatting")?.classList.remove("active");
+      $("#searchPanel")?.classList.remove("active");
+      $("#btnToggleSearch")?.classList.remove("active");
       closeProfileModal();
-      closeShortcutsModal();
+      const modalCont = document.getElementById("modalContainer");
+      if (modalCont) modalCont.innerHTML = "";
     }
     if (event.ctrlKey && event.key.toLowerCase() === "n") {
       event.preventDefault();
@@ -916,12 +1446,12 @@ async function handleGoogleLogin() {
   // Label hardcodeado para que el finally SIEMPRE restaure correctamente
   // sin importar cuantas veces se haya llamado antes
   const GOOGLE_SVG = `<svg width="18" height="18" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844a4.14 4.14 0 0 1-1.796 2.716v2.259h2.908c1.702-1.567 2.684-3.875 2.684-6.615z" fill="#4285F4"/><path d="M9 18c2.43 0 4.467-.806 5.956-2.184l-2.908-2.259c-.806.54-1.837.859-3.048.859-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 0 0 9 18z" fill="#34A853"/><path d="M3.964 10.705A5.41 5.41 0 0 1 3.682 9c0-.593.102-1.17.282-1.705V4.963H.957A8.996 8.996 0 0 0 0 9c0 1.452.348 2.827.957 4.037l3.007-2.332z" fill="#FBBC05"/><path d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.963L3.964 7.295C4.672 5.163 6.656 3.58 9 3.58z" fill="#EA4335"/></svg>`;
-  const ORIGINAL_LABEL = `${GOOGLE_SVG} Iniciar sesión`;
+  const ORIGINAL_LABEL = `${GOOGLE_SVG} Login`;
 
   try {
     if (btn) {
       btn.disabled = true;
-      btn.innerHTML = `${GOOGLE_SVG} Conectando...`;
+      btn.innerHTML = `${GOOGLE_SVG} Login...`;
     }
     setSyncState("syncing", "Conectando");
 
@@ -930,7 +1460,7 @@ async function handleGoogleLogin() {
       const invokePromise = window.__TAURI__.core.invoke("start_auth_server");
 
       // 2. Abrir la pasarela de auth en el navegador del sistema
-      await openUrl("https://zenwii.web.app/desktop-auth.html");
+      await openUrl("https://zenwii.web.app/notawin.html");
       notify("Se abrió tu navegador. Inicia sesión con Google y regresa aquí.", "info", 7000);
 
       // 3. Esperar a que el servidor Rust capture los tokens del browser
