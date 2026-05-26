@@ -1,5 +1,5 @@
 export const app = "Zenwii";
-export const version = "v11";
+export const version = "v10";
 export const defaultTheme = "Paz|#29c72e";
 export const noteCollection = "notas";
 export const firebaseConfig = {
@@ -12,12 +12,12 @@ export const firebaseConfig = {
 };
 
 /** ACTUALIZAR AL TAG POR SEGURIDAD [TAG NUEVO] (1)
-git tag v11 -m "Version v11" ; git push origin v11
+git tag v10 -m "Version v10" ; git push origin v10
 
 ACTUALIZACIÓN AL MAIN PRINCIPAL DEL PROYECTO [MAIN] (2)
-git add . ; git commit -m "Actualizacion Principal v11.10.10" ; git push origin main 
+git add . ; git commit -m "Actualizacion Principal v10.10.10" ; git push origin main 
 
 // REEMPLAZAR TAG DE SEGURIDAD EXISTENTE [TAG REMPLAZO] (3)
-git tag -d v11 ; git tag v11 -m "Version v11 actualizada" ; git push origin v11 --force
+git tag -d v10 ; git tag v10 -m "Version v10 actualizada" ; git push origin v10 --force
 
  ACTUALIZACION TAG[END] */
